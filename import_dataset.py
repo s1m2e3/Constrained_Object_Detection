@@ -64,7 +64,6 @@ def batched_import(dataset_path="Self Driving Car.v3-fixed-small.coco",
         batch_image = []
         batch_label = []
         for filename in batch:
-            print(f"--- Processing file: {filename} ---")
             image_path = os.path.join(export_path, filename)
 
             # Step 5a: Convert image to a NumPy array

@@ -569,3 +569,316 @@ class PatchGraphModelNoBatch(nn.Module):
         logits = self.head(y).squeeze(-1)                  # (L,)
 
         return torch.sigmoid(logits)  # use BCEWithLogitsLoss; apply sigmoid only for inference
+    
+
+
+
+class Centroid(nn.Module):
+    def __init__(self, in_channels:int =3, eps: float = 1e-3):
+        super().__init__()
+        self.mu = nn.Parameter(torch.ones(in_channels)*0.5,requires_grad=True)
+        self.L_raw = nn.Parameter(torch.tril(torch.randn(in_channels,in_channels)),requires_grad=True)
+    def make_L(self, min_diag=1e-4):
+        L = torch.tril(self.L_raw)  # zero-out above-diagonal
+        diag = torch.nn.functional.softplus(torch.diagonal(L, 0)) + min_diag
+        L = L.clone()
+        L.diagonal(0).copy_(diag)
+        return L
+    def make_Sigma(self, eps=1e-4):
+        L = torch.tril(self.make_L())
+        diag = torch.nn.functional.softplus(torch.diagonal(L, 0)) + eps
+        L = L.clone()
+        L.diagonal(0).copy_(diag)
+        Sigma = L @ L.T + eps*torch.eye(L.shape[0],device=L.device,dtype=L.dtype)
+        return Sigma
+    def forward(self,x,pi):
+        sigma = self.make_Sigma()
+        diff = (x-self.mu)
+        jitter = 1e-3
+        likelihood = (diff@torch.linalg.pinv(sigma+jitter*torch.eye(sigma.shape[0],device=sigma.device,dtype=sigma.dtype))*diff).sum(-1)
+        determinant = torch.linalg.det(sigma)
+        return (-likelihood/2-torch.log(determinant)/2+torch.log(pi))
+
+class GMM(nn.Module):
+    def __init__(self, in_channels:int =3, eps: float = 1e-3, num_gaussians=5):
+        super().__init__()
+        self.gaussians = nn.ModuleList([Centroid(in_channels,eps) for _ in range(num_gaussians)])
+        self.pi = nn.Parameter(torch.ones(num_gaussians)/num_gaussians,requires_grad=True)
+    def logits(self,x):
+        pi = torch.softmax(self.pi,dim=0)
+        return torch.stack([self.gaussians[i](x,pi[i]) for i in range(len(self.gaussians))],dim=1)
+    def forward(self,x):
+        logits = self.logits(x)
+        responsibilities = torch.softmax(logits,dim=1)
+        return responsibilities
+    def forward_loss(self,x):
+        logits = self.logits(x)
+        responsibilities = self.forward(x)
+        entropy = torch.special.xlogy(responsibilities,responsibilities)
+        return -responsibilities*logits+entropy
+
+class AsymmetricGaussianMF(nn.Module):
+    def __init__(self,num_mfs=3, c_init=0.0, sigmaL_init=0.05, sigmaR_init=0.05, min_sigma=1e-3, device='cpu'):
+        super().__init__()
+        c= torch.linspace(0,1,num_mfs)
+        self.c = nn.Parameter(torch.ones(num_mfs,requires_grad=True,dtype=torch.float32,device=device)*c)
+        # store raw params; map to positive via softplus in forward
+        self.sigmaL_raw = nn.Parameter(torch.ones(num_mfs,requires_grad=True,dtype=torch.float32,device=device)*sigmaL_init)
+        self.sigmaR_raw = nn.Parameter(torch.ones(num_mfs,requires_grad=True,dtype=torch.float32,device=device)*sigmaR_init)
+        self.min_sigma = min_sigma
+
+    def forward(self,x, eps=1e-12,T=1.0):
+        """
+        x: [N] or [N,1]
+        c, sigma_L, sigma_R: [M]
+        returns memberships: [N, M]
+        """
+        x = x.unsqueeze(-1)              # [N,1]
+        sL = F.softplus(self.sigmaL_raw) + eps   # [M]
+        sR = F.softplus(self.sigmaR_raw) + eps   # [M]
+        # broadcast: compare x vs c per MF
+        sigma = torch.where(x < self.c, sL, sR)   # [N,M]
+        z = (x - self.c) / sigma
+        z = -0.5 * z * z
+        return F.softmax(z/T, dim=1)
+
+class GaussianDownsample2x(nn.Module):
+    """
+    Anti-aliased 2× downsampling via depthwise Gaussian conv2d (stride=2).
+    - Input  : (N, C, H, W)
+    - Output : (N, C, H/2, W/2)   (H, W must be even or padding will extend)
+    Args:
+        sigma (float): Gaussian sigma in pixels.
+        kernel_size (int or None): odd kernel size. If None, computed as 2*round(3*sigma)+1.
+        padding_mode (str): 'reflect' (recommended), 'replicate', or 'zeros'.
+    """
+    def __init__(self, sigma: float = 1.0, kernel_size: int = None, padding_mode: str = 'reflect'):
+        super().__init__()
+        assert sigma > 0, "sigma must be > 0"
+        if kernel_size is None:
+            # cover ±3σ
+            kernel_size = int(2 * round(3 * sigma) + 1)
+        assert kernel_size % 2 == 1, "kernel_size must be odd"
+
+        self.sigma = float(sigma)
+        self.kernel_size = int(kernel_size)
+        self.padding_mode = padding_mode
+
+        # Build normalized 1D Gaussian kernel
+        radius = self.kernel_size // 2
+        x = torch.arange(-radius, radius + 1, dtype=torch.float32)
+        g1d = torch.exp(-(x ** 2) / (2 * self.sigma ** 2))
+        g1d = g1d / g1d.sum()
+
+        # 2D separable kernel via outer product
+        g2d = torch.outer(g1d, g1d)  # (k, k)
+        g2d = g2d / g2d.sum()        # just to be safe
+
+        # Register as buffer; we’ll expand to (C,1,k,k) at runtime
+        self.register_buffer('_kernel2d', g2d[None, None])  # shape (1,1,k,k)
+
+        # Cache to avoid re-expanding every forward
+        self._cached_C = None
+        self.register_buffer('_weight', None)  # will hold (C,1,k,k)
+
+    @torch.no_grad()
+    def _get_weight(self, C: int, device, dtype):
+        """
+        Expand the (1,1,k,k) kernel to (C,1,k,k) on the right device/dtype.
+        Cache per-channel count to avoid repeated expands.
+        """
+        if (self._cached_C != C) or (self._weight is None) \
+           or (self._weight.device != device) or (self._weight.dtype != dtype):
+            w = self._kernel2d.to(device=device, dtype=dtype).expand(C, 1, self.kernel_size, self.kernel_size).contiguous()
+            self._weight = w
+            self._cached_C = C
+        return self._weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Gaussian blur then downsample by stride=2 (single conv).
+        """
+        assert x.dim() == 4, "Expected input of shape (N, C, H, W)"
+        N, C, H, W = x.shape
+
+        pad = self.kernel_size // 2
+        if self.padding_mode == 'reflect':
+            x = F.pad(x, (pad, pad, pad, pad), mode='reflect')
+        elif self.padding_mode == 'replicate':
+            x = F.pad(x, (pad, pad, pad, pad), mode='replicate')
+        elif self.padding_mode == 'zeros':
+            x = F.pad(x, (pad, pad, pad, pad), mode='constant', value=0.0)
+        else:
+            raise ValueError(f"Unknown padding_mode: {self.padding_mode}")
+
+        w = self._get_weight(C, x.device, x.dtype)  # (C,1,k,k)
+        # Depthwise conv: groups=C makes each channel filtered independently
+        y = F.conv2d(x, w, bias=None, stride=2, padding=0, groups=C)
+        return y
+
+
+class GaussianUpsample2x(nn.Module):
+    """
+    Approximate synthesis for GaussianDownsample2x:
+      - Depthwise transposed conv (stride=2) with the same Gaussian kernel
+      - Kernel scaled by 4 to preserve DC after 2x decimation
+      - Crops 'pad' pixels to undo the forward external padding
+      - If out_hw is None: outputs exactly (2*Hs, 2*Ws)
+      - Optional mild unsharp-mask
+    """
+    def __init__(self, sigma: float = 1.0, kernel_size: int = None, padding_mode: str = 'reflect',
+                 sharpen_amount: float = 0.0):
+        super().__init__()
+        assert sigma > 0
+        if kernel_size is None:
+            kernel_size = int(2 * round(3 * sigma) + 1)  # odd
+        assert kernel_size % 2 == 1
+        self.sigma = float(sigma)
+        self.kernel_size = int(kernel_size)
+        self.padding_mode = padding_mode
+        self.sharpen_amount = float(sharpen_amount)
+
+        # Build normalized Gaussian
+        radius = self.kernel_size // 2
+        x = torch.arange(-radius, radius + 1, dtype=torch.float32)
+        g1d = torch.exp(-(x ** 2) / (2 * self.sigma ** 2))
+        g1d = g1d / g1d.sum()
+        g2d = torch.outer(g1d, g1d)
+        g2d = g2d / g2d.sum()
+
+        self.register_buffer('_kernel2d', g2d[None, None])  # (1,1,k,k)
+
+        self._cached_C = None
+        self.register_buffer('_w_t', None)  # (C,1,k,k) for transpose
+        self.register_buffer('_w_f', None)  # (C,1,k,k) for optional blur
+
+    @torch.no_grad()
+    def _get_weights(self, C: int, device, dtype):
+        if (self._cached_C != C) or (self._w_t is None) \
+           or (self._w_t.device != device) or (self._w_t.dtype != dtype):
+            k = self._kernel2d.to(device=device, dtype=dtype).expand(
+                C, 1, self.kernel_size, self.kernel_size
+            ).contiguous()
+            self._w_t = (4.0 * k)  # synthesis gain to restore DC after decimation
+            self._w_f = k
+            self._cached_C = C
+        return self._w_t, self._w_f
+
+    def forward(self, y: torch.Tensor, out_hw=None) -> torch.Tensor:
+        """
+        y: (N, C, Hs, Ws)
+        returns:
+          - if out_hw is None: shape (N, C, 2*Hs, 2*Ws)
+          - else: (N, C, H, W) with exact (H,W)
+        """
+        assert y.dim() == 4, "Expected (N, C, Hs, Ws)"
+        N, C, Hs, Ws = y.shape
+        w_t, w_f = self._get_weights(C, y.device, y.dtype)
+
+        p = self.kernel_size // 2
+
+        if out_hw is None:
+            # Target exact doubling: (2*Hs, 2*Ws)
+            opad_h = 1  # because (2*Hs - 1) + 1 = 2*Hs after cropping p each side
+            opad_w = 1
+            x = F.conv_transpose2d(
+                y, w_t, bias=None, stride=2, padding=0,
+                output_padding=(opad_h, opad_w),
+                groups=C
+            )
+            # Undo the forward external pad by cropping p each side
+            if p > 0:
+                x = x[..., p:-p, p:-p]
+            # Final clamp to exact 2x in case of border quirks
+            x = x[..., : (2*Hs), : (2*Ws)]
+        else:
+            # Target explicit (H, W)
+            H, W = out_hw
+            # Size before crop is (2*Hs - 1 + opad_h, 2*Ws - 1 + opad_w)
+            # Solve for opad_* in {0,1} to match H,W after crop:
+            # (2*Hs - 1 + opad_h) - 2*p  -> then clamp to H
+            opad_h = int(max(0, min(1, H - (2*Hs - 1))))
+            opad_w = int(max(0, min(1, W - (2*Ws - 1))))
+            x = F.conv_transpose2d(
+                y, w_t, bias=None, stride=2, padding=0,
+                output_padding=(opad_h, opad_w),
+                groups=C
+            )
+            if p > 0:
+                x = x[..., p:-p, p:-p]
+            x = x[..., :H, :W]
+
+        if self.sharpen_amount > 0.0:
+            # mild unsharp mask
+            xb = F.pad(x, (p, p, p, p), mode=self.padding_mode) if p > 0 else x
+            xb = F.conv2d(xb, w_f, bias=None, stride=1, padding=0, groups=C)
+            x = x + self.sharpen_amount * (x - xb)
+
+        return x
+
+
+class FuzzyModel(nn.Module):
+    def __init__(self, GMM,num_degrees=3, eps: float = 1e-3,kernel_size=7,num_convs=5, sub_patch_size=16):
+        super().__init__()
+        self.gmm = GMM
+        self.gaussian_memberships = nn.ModuleList([AsymmetricGaussianMF(num_mfs=num_degrees) for i in range(len(self.gmm.gaussians))])
+        self.texture_memberships = AsymmetricGaussianMF(num_mfs=num_degrees)
+        self.gaussian_downsample = GaussianDownsample2x(sigma=0.9, kernel_size=None, padding_mode='reflect')
+        self.gaussian_upsample = GaussianUpsample2x(sigma=0.9, kernel_size=None, padding_mode='reflect')
+
+        self.kernel_size = kernel_size
+        self.num_convs = num_convs
+        self.sub_patch_size = sub_patch_size
+        
+        
+
+    def fuzzify(self,x_gaussian,x_sobel):
+        N,H,W,C = x_gaussian.shape
+        results = []
+        for gaussian_mf in range(len(self.gaussian_memberships)):
+            results.append(self.gaussian_memberships[gaussian_mf](x_gaussian[:,gaussian_mf]))
+        results_gaussian = torch.stack(results,dim=2).permute(0,2,1)
+        results_sobel = self.texture_memberships(x_sobel)
+        results = torch.cat([results_gaussian,results_sobel],dim=1)
+        _,F,M=results.shape
+        return results.reshape(N,H,W,F*M)
+
+    def centroid(self,x):
+        x_gaussian = x[:,:,:,0:3]
+        N,H,W,C = x_gaussian.shape
+        x_gaussian = x_gaussian.reshape(N*H*W,C)
+        out = self.gmm(x_gaussian)
+        return out.reshape(N,H,W,-1)
+     
+    def forward(self,x):
+        
+        x_sobel = x[:,:,:,3:]
+        N,H,W,C=x.shape
+        x_centroids = self.centroid(x)
+        x = torch.concat([x_centroids,x_sobel],dim=3).permute(0,3,1,2)
+        N,C,H,W = x.shape
+        gh, gw = H // self.sub_patch_size, W // self.sub_patch_size
+        reshaped= x.reshape(N,C,gh,self.sub_patch_size,gw,self.sub_patch_size).permute(0,1,2,4,3,5).reshape(N,C,gh,gw,self.sub_patch_size*self.sub_patch_size)
+        print(reshaped.shape)
+        input('yipo')
+        gaussians = [self.gaussian_downsample(x)]
+        gaussians_same_size = [self.gaussian_upsample(gaussians[-1])]
+
+        for i in range(self.num_convs-1):
+
+            reduced = self.gaussian_downsample(gaussians[-1])
+            print(reduced.shape)
+            input('yipo')
+            gaussians.append(reduced)
+             
+        for i in range(len(gaussians)):
+            upsampled = gaussians[i]
+            for j in range (i+1):
+                upsampled = self.gaussian_upsample(upsampled)
+                
+            gaussians_same_size.append(upsampled)
+        gaussians_downsampled_upsampled = torch.stack(gaussians_same_size,dim=4)
+        print(gaussians_downsampled_upsampled.shape)
+        input('yipo')
+        
+        input('yipo')

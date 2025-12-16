@@ -129,8 +129,6 @@ def chromaticity(image_batch):
         processed_batch.append(chromaticity)
     return processed_batch
 
-
-
 def apply_grayness(image_batch):
     """
     Applies the Grayness filter to a batch of images.
@@ -138,17 +136,11 @@ def apply_grayness(image_batch):
     processed_batch = []
     for img in image_batch:
         img = img.astype(np.float32) / 255.0
-        red = img[:, :, 0]
-        green = img[:, :, 1]
-        blue = img[:, :, 2]
-        grayness = 1-(np.sqrt((red-green)**2+(green-blue)**2+(blue-red)**2))/np.sqrt(3)
-        min_grayness = np.min(grayness)
-        max_grayness = np.max(grayness)
-        grayness = ((grayness - min_grayness) / (max_grayness - min_grayness))**4
-
+        L = img.sum(axis=2)
+        C = img-L[:, :, None]
+        grayness =1-(np.sqrt(np.power(C,2).sum(axis=2))/(np.sqrt(np.power(img,2).sum(axis=2))+1e-5))
         processed_batch.append(grayness)
     return processed_batch
-
 
 def create_polynomial_features(image_batch):
     processed_batch = []
@@ -272,6 +264,34 @@ def apply_blue_normalized_index(image_batch):
         processed_batch.append(normalized_blue)
     return processed_batch
 
+def apply_excess_blue(image_batch):
+    processed_batch = []
+    for img in image_batch:
+        img = img.astype(np.float32) / 255.0
+        green = img[:, :, 1]
+        blue = img[:, :, 2]
+        red = img[:, :, 0]
+        normalized_blue= (blue)/(green+blue+red+1e-5)
+        normalized_red = (red)/(green+blue+red+1e-5)
+        normalized_green = (green)/(green+blue+red+1e-5)
+        excess_blue = 2*normalized_blue - normalized_red - normalized_green
+        processed_batch.append(excess_blue)
+    return processed_batch
+
+
+def apply_excess_green(image_batch):
+    processed_batch = []
+    for img in image_batch:
+        img = img.astype(np.float32) / 255.0
+        green = img[:, :, 1]
+        blue = img[:, :, 2]
+        red = img[:, :, 0]
+        normalized_blue= (blue)/(green+blue+red+1e-5)
+        normalized_red = (red)/(green+blue+red+1e-5)
+        normalized_green = (green)/(green+blue+red+1e-5)
+        excess_green = 2*normalized_green - normalized_red - normalized_blue
+        processed_batch.append(excess_green)
+    return processed_batch
 
 
 def apply_filters(image_batch,num_gaussians=1,num_laplacians=1,num_gabor=6):
@@ -311,11 +331,13 @@ def apply_filters(image_batch,num_gaussians=1,num_laplacians=1,num_gabor=6):
         np.stack(flatten(entropy_gabor := apply_gaussian_filter(apply_entropy(apply_gabor_filter(image_batch, num_gabor)))) ,axis=0),
         np.stack(flatten(blue_normalized_index := apply_blue_normalized_index(image_batch)) ,axis=0),
         np.stack(flatten(green_normalized_index := apply_green_normalized_index(image_batch)) ,axis=0),
-        
     ),axis=3)
     polynomial_batch = np.stack(create_polynomial_features(image_batch),axis=0)
     all_processed = np.concatenate((all_processed,polynomial_batch),axis=3)
     return all_processed
+
+
+
 
 def binarize_objectness(image_batch,label_batch,num_classes=12):
     H,W,_ = image_batch[0].shape
