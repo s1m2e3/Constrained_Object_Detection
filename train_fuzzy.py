@@ -2,8 +2,9 @@ import torch
 import os
 from model import GMM,FuzzyModel
 from import_dataset import batched_import
-from pre_process import apply_sobel_filter
+from pre_process import apply_sobel_filter, binarize_objectness
 import numpy as np
+import gc
 
 
 def apply_filters(image_batch):
@@ -37,6 +38,8 @@ def apply_filters(image_batch):
 
 
 def main():
+    gc.collect()
+    torch.cuda.empty_cache()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     weights_dir = 'weights'
     weights_path = os.path.join(weights_dir, 'GMM.pt')
@@ -49,11 +52,14 @@ def main():
         optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=0.00001)
         lambda_weight = 1e-2
         for k in range(2):
-            batch_image, _ = batched_import(batch_size=8)
+            batch_image, batch_labels = batched_import(batch_size=2)
+            processed_label_batch = binarize_objectness(batch_image,batch_labels)
             filter_image = apply_filters(batch_image)
             batch_image = (torch.from_numpy(np.concatenate([np.array(batch_image),filter_image],axis=3)).float()/255).to(device)
             pred = model.forward(batch_image)
-            input('yipi') 
+            print(pred.shape)
+            print(processed_label_batch.shape)
+            input('yipi')
             # for i in range(8*512*512//2000):
             #     optimizer.zero_grad()
             #     batch = batch_image[i*2000:(i+1)*2000]

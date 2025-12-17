@@ -817,8 +817,21 @@ class GaussianUpsample2x(nn.Module):
         return x
 
 
+class PreLNWrapper(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(embed_dim)  # or RMSNorm(embed_dim)
+
+    def forward(self, mha, x, **sdpa_kwargs):
+        # x: (N_tokens, T, C) with C == mha.embed_dim
+        x_norm = self.norm(x)
+        y = self._sdpa_with_proj(mha, x_norm, **sdpa_kwargs)  # your mha_via_sdpa
+        return x + y  # residual
+
+
+
 class FuzzyModel(nn.Module):
-    def __init__(self, GMM,num_degrees=3, eps: float = 1e-3,kernel_size=7,num_convs=6, sub_patch_size=4,embed_dim=64,num_heads=8):
+    def __init__(self, GMM,num_degrees=3, eps: float = 1e-3,kernel_size=7,num_convs=6, sub_patch_size=4,embed_dim=64,num_heads=8, num_classes = 12):
         super().__init__()
         self.gmm = GMM
         self.gaussian_memberships = nn.ModuleList([AsymmetricGaussianMF(num_mfs=num_degrees) for i in range(len(self.gmm.gaussians))])
@@ -827,7 +840,12 @@ class FuzzyModel(nn.Module):
         self.gaussian_upsample = GaussianUpsample2x(sigma=0.9, kernel_size=None, padding_mode='reflect')
         self.mha_intra_patch = nn.ModuleList([nn.MultiheadAttention(embed_dim=(len(self.gmm.gaussians)+1), num_heads=(len(self.gmm.gaussians)+1), batch_first=True,dropout=0.1) for _ in range(num_convs+1)])
         self.mha_inter_patch = nn.ModuleList([nn.MultiheadAttention(embed_dim=(len(self.gmm.gaussians)+1), num_heads=(len(self.gmm.gaussians)+1), batch_first=True,dropout=0.1) for _ in range(num_convs+1)])
-
+        self.ln_intra = nn.ModuleList([nn.LayerNorm((len(self.gmm.gaussians)+1)) for _ in range(num_convs+1)])
+        self.ln_inter = nn.ModuleList([nn.LayerNorm((len(self.gmm.gaussians)+1)) for _ in range(num_convs+1)])
+        
+        self.linear_1 = nn.Linear(num_convs*num_convs*2, embed_dim)
+        self.linear_2 = nn.Linear(embed_dim, embed_dim)
+        self.linear_3 = nn.Linear(embed_dim, num_classes)
         self.kernel_size = kernel_size
         self.num_convs = num_convs
         self.sub_patch_size = sub_patch_size
@@ -905,7 +923,7 @@ class FuzzyModel(nn.Module):
         return y
 
 
-    def attention(self,x,conv_index,mha_list):
+    def attention(self,x,conv_index,mha_list,ln_list):
 
         B, C, H, W, T = x.shape
         # (B, C, H, W, T) -> (B, H, W, T, C)
@@ -913,6 +931,8 @@ class FuzzyModel(nn.Module):
 
         # Flatten spatial -> (B*H*W, T, C)
         x_flat = x_bhw_tc.reshape(B*H*W, T, C)
+        
+        x_flat = ln_list[conv_index](x_flat)
         
         y_flat = torch.empty_like(x_flat)
         chunk_size = 256
@@ -941,11 +961,11 @@ class FuzzyModel(nn.Module):
         x_centroids = self.centroid(x)
         x = torch.concat([x_centroids,x_sobel],dim=3).permute(0,3,1,2)
         x_patch = self.patchify(x)
-        x_intra_patch = self.attention(x_patch,0,self.mha_intra_patch)
+        x_intra_patch = self.attention(x_patch,0,self.mha_intra_patch,self.ln_intra)
         x_intra = self.depatch(x_intra_patch)
         x_patch_mean = x_patch.mean(dim=-1)
         x_patch_mean_patch = self.patchify(x_patch_mean)
-        x_patch_mean_patch_inter = self.attention(x_patch_mean_patch,0,self.mha_inter_patch)
+        x_patch_mean_patch_inter = self.attention(x_patch_mean_patch,0,self.mha_inter_patch,self.ln_inter)
         x_inter = self.depatch(x_patch_mean_patch_inter)
         original_intras = [x_intra]
         original_inters = [x_inter]
@@ -957,12 +977,12 @@ class FuzzyModel(nn.Module):
         for i in range(self.num_convs-1):
             new_x = downsamples[-1]
             new_x_patch = self.patchify(new_x)
-            new_x_intra_patch = self.attention(new_x_patch,i+1,self.mha_intra_patch)
+            new_x_intra_patch = self.attention(new_x_patch,i+1,self.mha_intra_patch,self.ln_intra)
             new_x_intra = self.depatch(new_x_intra_patch)
             original_intras.append(new_x_intra)
             new_x_patch_mean = new_x_patch.mean(dim=-1)
             new_x_patch_mean_patch = self.patchify(new_x_patch_mean)
-            new_x_patch_mean_patch_inter = self.attention(new_x_patch_mean_patch,i+1,self.mha_inter_patch)
+            new_x_patch_mean_patch_inter = self.attention(new_x_patch_mean_patch,i+1,self.mha_inter_patch,self.ln_inter)
             new_x_inter = self.depatch(new_x_patch_mean_patch_inter)
             original_inters.append(new_x_inter)
             downsamples.append(self.gaussian_downsample(original_intras[-1]))
@@ -977,14 +997,15 @@ class FuzzyModel(nn.Module):
             for _ in range(inter_upsamples):
                 inter = self.gaussian_upsample(inter)
             upsample_inter.append(inter)
-            
-        upsample_inter = torch.stack(upsample_inter,dim=4)
-        upsample_intra = torch.stack(upsample_intra,dim=4)
-        print(upsample_inter.shape,upsample_intra.shape)
-        input('yipo')
-        #     gaussians_same_size.append(upsampled)
-        # gaussians_downsampled_upsampled = torch.stack(gaussians_same_size,dim=4)
-        # print(gaussians_downsampled_upsampled.shape)
-        # input('yipo')
         
-        # input('yipo')
+        upsample_intra = torch.stack(upsample_intra,dim=4)
+        upsample_inter = torch.stack(upsample_inter,dim=4)
+        final_attention = torch.concatenate([upsample_inter,upsample_intra],dim=4).permute(0,2,3,1,4)
+        N,H,W,C1,C2 = final_attention.shape
+        final_attention = final_attention.reshape(N,H,W,C1*C2)
+        x = self.linear_1(final_attention)
+        x = F.gelu(x)
+        x = self.linear_2(x)
+        x = F.gelu(x)
+        x = self.linear_3(x)
+        return x.permute(0,3,1,2)
