@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-
+import numpy as np
 
 # ----------------------- utilities -----------------------
 
@@ -818,20 +818,20 @@ class GaussianUpsample2x(nn.Module):
 
 
 class FuzzyModel(nn.Module):
-    def __init__(self, GMM,num_degrees=3, eps: float = 1e-3,kernel_size=7,num_convs=5, sub_patch_size=16):
+    def __init__(self, GMM,num_degrees=3, eps: float = 1e-3,kernel_size=7,num_convs=6, sub_patch_size=4,embed_dim=64,num_heads=8):
         super().__init__()
         self.gmm = GMM
         self.gaussian_memberships = nn.ModuleList([AsymmetricGaussianMF(num_mfs=num_degrees) for i in range(len(self.gmm.gaussians))])
         self.texture_memberships = AsymmetricGaussianMF(num_mfs=num_degrees)
         self.gaussian_downsample = GaussianDownsample2x(sigma=0.9, kernel_size=None, padding_mode='reflect')
         self.gaussian_upsample = GaussianUpsample2x(sigma=0.9, kernel_size=None, padding_mode='reflect')
+        self.mha_intra_patch = nn.ModuleList([nn.MultiheadAttention(embed_dim=(len(self.gmm.gaussians)+1), num_heads=(len(self.gmm.gaussians)+1), batch_first=True,dropout=0.1) for _ in range(num_convs+1)])
+        self.mha_inter_patch = nn.ModuleList([nn.MultiheadAttention(embed_dim=(len(self.gmm.gaussians)+1), num_heads=(len(self.gmm.gaussians)+1), batch_first=True,dropout=0.1) for _ in range(num_convs+1)])
 
         self.kernel_size = kernel_size
         self.num_convs = num_convs
         self.sub_patch_size = sub_patch_size
-        
-        
-
+                
     def fuzzify(self,x_gaussian,x_sobel):
         N,H,W,C = x_gaussian.shape
         results = []
@@ -849,36 +849,142 @@ class FuzzyModel(nn.Module):
         x_gaussian = x_gaussian.reshape(N*H*W,C)
         out = self.gmm(x_gaussian)
         return out.reshape(N,H,W,-1)
-     
+
+    def patchify(self,x):
+        N,C,H,W = x.shape
+        gh, gw = H // self.sub_patch_size, W // self.sub_patch_size
+        reshaped= x.reshape(N,C,gh,self.sub_patch_size,gw,self.sub_patch_size).permute(0,1,2,4,3,5).reshape(N,C,gh,gw,self.sub_patch_size*self.sub_patch_size)
+        return reshaped
+    
+    
+    def mha_via_sdpa(self, mha: torch.nn.MultiheadAttention, x: torch.Tensor,
+                    attn_mask=None, key_padding_mask=None, is_causal=False):
+        """
+        x: (N, T, E) if mha.batch_first=True, else (T, N, E)
+        Returns: y with same shape as x.
+        Uses mha's parameters (in_proj + out_proj) but computes attention via SDPA.
+        """
+        assert mha.batch_first, "This helper assumes batch_first=True for simplicity."
+        N, T, E = x.shape
+        h = mha.num_heads
+        assert E == mha.embed_dim
+        d = E // h
+        assert d * h == E
+
+        # 1) Compute Q, K, V using the same packed projection as nn.MultiheadAttention
+        #    qkv: (N, T, 3E)
+        qkv = F.linear(x, mha.in_proj_weight, mha.in_proj_bias)
+        q, k, v = qkv.chunk(3, dim=-1)  # each: (N, T, E)
+
+        # 2) Reshape to (N, h, T, d) as expected by SDPA
+        q = q.view(N, T, h, d).transpose(1, 2)  # (N, h, T, d)
+        k = k.view(N, T, h, d).transpose(1, 2)
+        v = v.view(N, T, h, d).transpose(1, 2)
+
+        # 3) Key padding mask handling (optional)
+        # SDPA supports an attn_mask; for key padding mask, you can fold it into attn_mask.
+        # key_padding_mask: (N, T) with True for "pad" positions to be masked out.
+        if key_padding_mask is not None:
+            # Build an additive mask with -inf on padded keys.
+            # Shape should broadcast to (N, h, T, T): mask over keys dimension.
+            # mask[n, 1, 1, s] = -inf if key_padding_mask[n, s] is True
+            pad = key_padding_mask[:, None, None, :].to(torch.bool)  # (N,1,1,T)
+            pad_mask = torch.zeros((N, 1, 1, T), device=x.device, dtype=x.dtype)
+            pad_mask = pad_mask.masked_fill(pad, float("-inf"))
+            attn_mask = pad_mask if attn_mask is None else attn_mask + pad_mask
+
+        # 4) SDPA
+        # Returns (N, h, T, d)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
+
+        # 5) Merge heads: (N, T, E)
+        y = y.transpose(1, 2).contiguous().view(N, T, E)
+
+        # 6) Output projection (same as MHA)
+        y = F.linear(y, mha.out_proj.weight, mha.out_proj.bias)
+        return y
+
+
+    def attention(self,x,conv_index,mha_list):
+
+        B, C, H, W, T = x.shape
+        # (B, C, H, W, T) -> (B, H, W, T, C)
+        x_bhw_tc = x.permute(0, 2, 3, 4, 1)
+
+        # Flatten spatial -> (B*H*W, T, C)
+        x_flat = x_bhw_tc.reshape(B*H*W, T, C)
+        
+        y_flat = torch.empty_like(x_flat)
+        chunk_size = 256
+        for i in range(0,x_flat.shape[0],chunk_size):
+            e = min(i+chunk_size,x_flat.shape[0])
+            y_flat[i:e]=self.mha_via_sdpa(mha_list[conv_index],x_flat[i:e])
+
+        # Restore shape -> (B, H, W, T, C)
+        y_bhw_tc = y_flat.reshape(B, H, W, T, C)
+        
+        # Back to original layout if you prefer channels-first with time last: (B, C, H, W, T)
+        y = y_bhw_tc.permute(0, 4, 1, 2, 3)
+        
+        return y
+    def depatch(self,x):
+        N,C,gH,gW,T = x.shape
+        p = self.sub_patch_size
+        assert p*p == T
+        x = x.reshape(N,C,gH,gW,p,p).permute(0,1,2,4,3,5).reshape(N,C,p*gH,p*gW)
+        return x
+
     def forward(self,x):
         
         x_sobel = x[:,:,:,3:]
         N,H,W,C=x.shape
         x_centroids = self.centroid(x)
         x = torch.concat([x_centroids,x_sobel],dim=3).permute(0,3,1,2)
-        N,C,H,W = x.shape
-        gh, gw = H // self.sub_patch_size, W // self.sub_patch_size
-        reshaped= x.reshape(N,C,gh,self.sub_patch_size,gw,self.sub_patch_size).permute(0,1,2,4,3,5).reshape(N,C,gh,gw,self.sub_patch_size*self.sub_patch_size)
-        print(reshaped.shape)
-        input('yipo')
-        gaussians = [self.gaussian_downsample(x)]
-        gaussians_same_size = [self.gaussian_upsample(gaussians[-1])]
-
-        for i in range(self.num_convs-1):
-
-            reduced = self.gaussian_downsample(gaussians[-1])
-            print(reduced.shape)
-            input('yipo')
-            gaussians.append(reduced)
-             
-        for i in range(len(gaussians)):
-            upsampled = gaussians[i]
-            for j in range (i+1):
-                upsampled = self.gaussian_upsample(upsampled)
-                
-            gaussians_same_size.append(upsampled)
-        gaussians_downsampled_upsampled = torch.stack(gaussians_same_size,dim=4)
-        print(gaussians_downsampled_upsampled.shape)
-        input('yipo')
+        x_patch = self.patchify(x)
+        x_intra_patch = self.attention(x_patch,0,self.mha_intra_patch)
+        x_intra = self.depatch(x_intra_patch)
+        x_patch_mean = x_patch.mean(dim=-1)
+        x_patch_mean_patch = self.patchify(x_patch_mean)
+        x_patch_mean_patch_inter = self.attention(x_patch_mean_patch,0,self.mha_inter_patch)
+        x_inter = self.depatch(x_patch_mean_patch_inter)
+        original_intras = [x_intra]
+        original_inters = [x_inter]
         
+        downsamples = [self.gaussian_downsample(original_intras[0])]
+        upsample_intra = [original_intras[0]]
+        upsample_inter = [self.gaussian_upsample(self.gaussian_upsample(original_inters[0]))]
+        
+        for i in range(self.num_convs-1):
+            new_x = downsamples[-1]
+            new_x_patch = self.patchify(new_x)
+            new_x_intra_patch = self.attention(new_x_patch,i+1,self.mha_intra_patch)
+            new_x_intra = self.depatch(new_x_intra_patch)
+            original_intras.append(new_x_intra)
+            new_x_patch_mean = new_x_patch.mean(dim=-1)
+            new_x_patch_mean_patch = self.patchify(new_x_patch_mean)
+            new_x_patch_mean_patch_inter = self.attention(new_x_patch_mean_patch,i+1,self.mha_inter_patch)
+            new_x_inter = self.depatch(new_x_patch_mean_patch_inter)
+            original_inters.append(new_x_inter)
+            downsamples.append(self.gaussian_downsample(original_intras[-1]))
+        for i in range(1,len(downsamples)):
+            intra = original_intras[i]
+            intra_upsamples = int(np.log2(original_intras[0].shape[-1]//intra.shape[-1]))
+            inter = original_inters[i]
+            inter_upsamples = int(np.log2((original_intras[0].shape[-1]//inter.shape[-1])))
+            for _ in range(intra_upsamples):
+                intra = self.gaussian_upsample(intra)
+            upsample_intra.append(intra)
+            for _ in range(inter_upsamples):
+                inter = self.gaussian_upsample(inter)
+            upsample_inter.append(inter)
+            
+        upsample_inter = torch.stack(upsample_inter,dim=4)
+        upsample_intra = torch.stack(upsample_intra,dim=4)
+        print(upsample_inter.shape,upsample_intra.shape)
         input('yipo')
+        #     gaussians_same_size.append(upsampled)
+        # gaussians_downsampled_upsampled = torch.stack(gaussians_same_size,dim=4)
+        # print(gaussians_downsampled_upsampled.shape)
+        # input('yipo')
+        
+        # input('yipo')
