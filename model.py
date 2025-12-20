@@ -598,7 +598,9 @@ class Centroid(nn.Module):
         likelihood = (diff@torch.linalg.pinv(sigma+jitter*torch.eye(sigma.shape[0],device=sigma.device,dtype=sigma.dtype))*diff).sum(-1)
         determinant = torch.linalg.det(sigma)
         return (-likelihood/2-torch.log(determinant)/2+torch.log(pi))
-
+    def forward_distances(self,x,pi):
+        diff = (x-self.mu)**2
+        return diff
 class GMM(nn.Module):
     def __init__(self, in_channels:int =3, eps: float = 1e-3, num_gaussians=5):
         super().__init__()
@@ -607,6 +609,10 @@ class GMM(nn.Module):
     def logits(self,x):
         pi = torch.softmax(self.pi,dim=0)
         return torch.stack([self.gaussians[i](x,pi[i]) for i in range(len(self.gaussians))],dim=1)
+    def forward_with_distances(self,x):
+        pi = torch.softmax(self.pi,dim=0)
+        distances = torch.stack([self.gaussians[i].forward_distances(x,pi[i]) for i in range(len(self.gaussians))],dim=1)
+        return distances
     def forward(self,x):
         logits = self.logits(x)
         responsibilities = torch.softmax(logits,dim=1)
@@ -616,6 +622,14 @@ class GMM(nn.Module):
         responsibilities = self.forward(x)
         entropy = torch.special.xlogy(responsibilities,responsibilities)
         return -responsibilities*logits+entropy
+    def centroid_loss(self):
+        loss = 0
+        for centroid in self.gaussians:
+            for centroid_2 in self.gaussians: 
+                if centroid is not centroid_2:
+                    loss = ((centroid.mu - centroid_2.mu)**2).sum() + loss
+        return loss
+
 
 class AsymmetricGaussianMF(nn.Module):
     def __init__(self,num_mfs=3, c_init=0.0, sigmaL_init=0.05, sigmaR_init=0.05, min_sigma=1e-3, device='cpu'):
@@ -675,11 +689,11 @@ class GaussianDownsample2x(nn.Module):
         g2d = g2d / g2d.sum()        # just to be safe
 
         # Register as buffer; we’ll expand to (C,1,k,k) at runtime
-        self.register_buffer('_kernel2d', g2d[None, None])  # shape (1,1,k,k)
+        self.register_buffer('_kernel2d', g2d[None, None], persistent=False)  # shape (1,1,k,k)
 
         # Cache to avoid re-expanding every forward
         self._cached_C = None
-        self.register_buffer('_weight', None)  # will hold (C,1,k,k)
+        self.register_buffer('_weight', None, persistent=False)  # will hold (C,1,k,k)
 
     @torch.no_grad()
     def _get_weight(self, C: int, device, dtype):
@@ -746,11 +760,11 @@ class GaussianUpsample2x(nn.Module):
         g2d = torch.outer(g1d, g1d)
         g2d = g2d / g2d.sum()
 
-        self.register_buffer('_kernel2d', g2d[None, None])  # (1,1,k,k)
+        self.register_buffer('_kernel2d', g2d[None, None], persistent=False)  # (1,1,k,k)
 
         self._cached_C = None
-        self.register_buffer('_w_t', None)  # (C,1,k,k) for transpose
-        self.register_buffer('_w_f', None)  # (C,1,k,k) for optional blur
+        self.register_buffer('_w_t', None, persistent=False)  # (C,1,k,k) for transpose
+        self.register_buffer('_w_f', None, persistent=False)  # (C,1,k,k) for optional blur
 
     @torch.no_grad()
     def _get_weights(self, C: int, device, dtype):
@@ -828,8 +842,6 @@ class PreLNWrapper(nn.Module):
         y = self._sdpa_with_proj(mha, x_norm, **sdpa_kwargs)  # your mha_via_sdpa
         return x + y  # residual
 
-
-
 class FuzzyModel(nn.Module):
     def __init__(self, GMM,num_degrees=3, eps: float = 1e-3,kernel_size=7,num_convs=6, sub_patch_size=4,embed_dim=64,num_heads=8, num_classes = 12):
         super().__init__()
@@ -838,14 +850,19 @@ class FuzzyModel(nn.Module):
         self.texture_memberships = AsymmetricGaussianMF(num_mfs=num_degrees)
         self.gaussian_downsample = GaussianDownsample2x(sigma=0.9, kernel_size=None, padding_mode='reflect')
         self.gaussian_upsample = GaussianUpsample2x(sigma=0.9, kernel_size=None, padding_mode='reflect')
-        self.mha_intra_patch = nn.ModuleList([nn.MultiheadAttention(embed_dim=(len(self.gmm.gaussians)+1), num_heads=(len(self.gmm.gaussians)+1), batch_first=True,dropout=0.1) for _ in range(num_convs+1)])
-        self.mha_inter_patch = nn.ModuleList([nn.MultiheadAttention(embed_dim=(len(self.gmm.gaussians)+1), num_heads=(len(self.gmm.gaussians)+1), batch_first=True,dropout=0.1) for _ in range(num_convs+1)])
-        self.ln_intra = nn.ModuleList([nn.LayerNorm((len(self.gmm.gaussians)+1)) for _ in range(num_convs+1)])
-        self.ln_inter = nn.ModuleList([nn.LayerNorm((len(self.gmm.gaussians)+1)) for _ in range(num_convs+1)])
-        
-        self.linear_1 = nn.Linear(num_convs*num_convs*2, embed_dim)
+        self.mha_intra_patch = nn.ModuleList([nn.MultiheadAttention(embed_dim=((len(self.gmm.gaussians)*4)+1), num_heads=((4*len(self.gmm.gaussians))+1), batch_first=True,dropout=0.1) for _ in range(num_convs+1)])
+        self.mha_inter_patch = nn.ModuleList([nn.MultiheadAttention(embed_dim=((len(self.gmm.gaussians)*4)+1), num_heads=((4*len(self.gmm.gaussians))+1), batch_first=True,dropout=0.1) for _ in range(num_convs+1)])
+        self.ln_intra = nn.ModuleList([nn.LayerNorm((4*(len(self.gmm.gaussians))+1)) for _ in range(num_convs+1)])
+        self.ln_inter = nn.ModuleList([nn.LayerNorm((4*(len(self.gmm.gaussians))+1)) for _ in range(num_convs+1)])
+        self.ln_outer = nn.LayerNorm(((4*(len(self.gmm.gaussians))+1))*(num_convs*2))
+        self.bn_downsample = nn.ModuleList([nn.BatchNorm2d((4*(len(self.gmm.gaussians))+1)) for _ in range(num_convs+1)])
+        self.bn_upsample_intra = nn.ModuleList([nn.BatchNorm2d((4*(len(self.gmm.gaussians))+1)) for _ in range(num_convs+1)])
+        self.bn_upsample_inter = nn.ModuleList([nn.BatchNorm2d((4*(len(self.gmm.gaussians))+1)) for _ in range(num_convs+1)])
+        self.linear_1 = nn.Linear(((4*(len(self.gmm.gaussians))+1))*(num_convs*2), embed_dim)
         self.linear_2 = nn.Linear(embed_dim, embed_dim)
         self.linear_3 = nn.Linear(embed_dim, num_classes)
+        self.bn_centroid = nn.BatchNorm2d((len(self.gmm.gaussians)))
+        self.bn_centroid_colors = nn.BatchNorm2d(3*(len(self.gmm.gaussians)))
         self.kernel_size = kernel_size
         self.num_convs = num_convs
         self.sub_patch_size = sub_patch_size
@@ -865,8 +882,16 @@ class FuzzyModel(nn.Module):
         x_gaussian = x[:,:,:,0:3]
         N,H,W,C = x_gaussian.shape
         x_gaussian = x_gaussian.reshape(N*H*W,C)
-        out = self.gmm(x_gaussian)
-        return out.reshape(N,H,W,-1)
+        out = self.gmm(x_gaussian).reshape(N,H,W,-1).permute(0,3,1,2)
+        out = self.bn_centroid(out)
+        return out.permute(0,2,3,1)
+    def centroid_distances(self,x):
+        x_gaussian = x[:,:,:,0:3]
+        N,H,W,C = x_gaussian.shape
+        x_gaussian = x_gaussian.reshape(N*H*W,C)
+        out = self.gmm.forward_with_distances(x_gaussian).reshape(N,H,W,-1).permute(0,3,1,2)
+        out = self.bn_centroid_colors(out)
+        return out.permute(0,2,3,1)
 
     def patchify(self,x):
         N,C,H,W = x.shape
@@ -959,6 +984,7 @@ class FuzzyModel(nn.Module):
         x_sobel = x[:,:,:,3:]
         N,H,W,C=x.shape
         x_centroids = self.centroid(x)
+        # x_centroid_distances = self.centroid_distances(x)
         x = torch.concat([x_centroids,x_sobel],dim=3).permute(0,3,1,2)
         x_patch = self.patchify(x)
         x_intra_patch = self.attention(x_patch,0,self.mha_intra_patch,self.ln_intra)
@@ -969,10 +995,9 @@ class FuzzyModel(nn.Module):
         x_inter = self.depatch(x_patch_mean_patch_inter)
         original_intras = [x_intra]
         original_inters = [x_inter]
-        
-        downsamples = [self.gaussian_downsample(original_intras[0])]
-        upsample_intra = [original_intras[0]]
-        upsample_inter = [self.gaussian_upsample(self.gaussian_upsample(original_inters[0]))]
+        downsamples = [self.bn_downsample[0](self.gaussian_downsample(original_intras[0]))]
+        upsample_intra = [self.bn_downsample[0](original_intras[0])]
+        upsample_inter = [self.gaussian_upsample(self.gaussian_upsample(self.bn_upsample_inter[0](original_inters[0])))]
         
         for i in range(self.num_convs-1):
             new_x = downsamples[-1]
@@ -985,11 +1010,11 @@ class FuzzyModel(nn.Module):
             new_x_patch_mean_patch_inter = self.attention(new_x_patch_mean_patch,i+1,self.mha_inter_patch,self.ln_inter)
             new_x_inter = self.depatch(new_x_patch_mean_patch_inter)
             original_inters.append(new_x_inter)
-            downsamples.append(self.gaussian_downsample(original_intras[-1]))
+            downsamples.append(self.bn_downsample[i](self.gaussian_downsample(original_intras[-1])))
         for i in range(1,len(downsamples)):
-            intra = original_intras[i]
+            intra = self.bn_upsample_intra[i](original_intras[i])
             intra_upsamples = int(np.log2(original_intras[0].shape[-1]//intra.shape[-1]))
-            inter = original_inters[i]
+            inter = self.bn_upsample_inter[i](original_inters[i])
             inter_upsamples = int(np.log2((original_intras[0].shape[-1]//inter.shape[-1])))
             for _ in range(intra_upsamples):
                 intra = self.gaussian_upsample(intra)
@@ -997,15 +1022,54 @@ class FuzzyModel(nn.Module):
             for _ in range(inter_upsamples):
                 inter = self.gaussian_upsample(inter)
             upsample_inter.append(inter)
-        
+            
         upsample_intra = torch.stack(upsample_intra,dim=4)
         upsample_inter = torch.stack(upsample_inter,dim=4)
         final_attention = torch.concatenate([upsample_inter,upsample_intra],dim=4).permute(0,2,3,1,4)
         N,H,W,C1,C2 = final_attention.shape
         final_attention = final_attention.reshape(N,H,W,C1*C2)
-        x = self.linear_1(final_attention)
+        x = self.linear_1(self.ln_outer(final_attention))
         x = F.gelu(x)
         x = self.linear_2(x)
         x = F.gelu(x)
         x = self.linear_3(x)
         return x.permute(0,3,1,2)
+    def normalize(self,pred):
+        mean_per_image = pred.mean(dim=(1,2,3),keepdim=True)
+        std_per_image = pred.std(dim=(1,2,3),keepdim=True)
+        pred_normalized = (pred - mean_per_image) / std_per_image
+        return pred_normalized    
+
+    def eval_constraints(self,x,index_pos,index_neg):
+        x_normalized = self.normalize(x)
+        const_geq = self.constraint_pos_geq(x_normalized[index_pos])
+        const_leq = self.constraint_neg_leq(x_normalized[index_neg])
+        constraints = torch.concatenate([const_geq,const_leq],dim=0)
+        constraints = torch.where(constraints>0.1,constraints,0)
+        counter = 0
+        while torch.any(constraints>0.1).item():
+            
+            grad = torch.autograd.grad(constraints.sum(),x,create_graph=True,retain_graph=True)[0]
+            x = x - 100*grad
+            x_normalized = self.normalize(x)
+            const_geq = self.constraint_pos_geq(x_normalized[index_pos])
+            const_leq = self.constraint_neg_leq(x_normalized[index_neg])
+            constraints = torch.concatenate([const_geq,const_leq],dim=0)
+            constraints = torch.where(constraints>0.1,constraints,0)
+            print("gradient step",counter,constraints.norm())
+            counter += 1
+            if counter>6:
+                return x
+    #                 break
+    #     return self.normalize_prediction(x)
+    
+    def inequality_eval(self,x):
+        return torch.nn.functional.softplus(x)
+    
+    def constraint_pos_geq(self,x):
+        x = self.inequality_eval(-x)
+        return x
+    def constraint_neg_leq(self,x):
+        x = self.inequality_eval(x)
+        return x
+    
